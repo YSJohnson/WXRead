@@ -9,7 +9,7 @@ import re
 from typing import Type, Dict
 
 from httpx import URL
-from pydantic import BaseModel, create_model, Field,  HttpUrl, validator
+from pydantic import BaseModel, create_model, Field, HttpUrl, validator
 
 from schema.common import CommonGlobalConfig, CommonPartConfig
 
@@ -26,7 +26,8 @@ class CommonKLYDConfig(BaseModel):
     """可乐阅读全局和局部的相同配置"""
     withdraw_type: str = Field(None, description="提现类型: wx 微信, ali 支付宝")
     just_in_case: bool | None = Field(None, description="以防万一开关")
-    custom_detected_count: list | None = Field(None, description="达到指定阅读篇数走推送通道")
+    unknown_to_push: bool | None = Field(None, description="未知走推送开关")
+
 
 class KLYDAccount(CommonPartConfig, CommonKLYDConfig):
     """账号配置（局部配置）"""
@@ -192,15 +193,19 @@ class RspDoRead(BaseModel):
 
         经过粗略的观察，一般来说：
         返回2个，可能出现以下情况:
-            - 需要检测
+            - 此数据返回的结果检测状态未知，目前只能通过匹配特征biz的方式来筛选
                 {
                   "jkey": "MDAwMDAwMDAwM......",
                   "url": "https://mp.weixin.qq.com/s?__biz=Mzg2OTYyNDY1OQ==&mid=2247649861&idx=1&sn=f0216ebeec1edb6c30ba1ab54a6fec7d&scene=0#wechat_redirect"
                 }
-            - 未知状态
+            - 未知状态，现猜测是当前无文章可分配
                 {
                   "jkey": "MDAwMDAwMDAwMH6et2yHiryRsqu64L67gKOXfIvLlWra145qlc2LjI2BlKDGmIZmypO5qtTXu6iMaoh6nbSIfdLNmGvMmA",
                   "url": null
+                }
+                {
+                  "msg": "异常访问，请重试",
+                  "url": "close"
                 }
             - 检测失败
                 {
@@ -224,7 +229,7 @@ class RspDoRead(BaseModel):
                   "jkey": "MDAwMDAw........",
                   "url": "https://mp.weixin.qq.com/s?__biz=Mzg3Nzg4OTA4Ng==&mid=2247526971&idx=1&sn=2edf88cefcf3e30f988fab3f1f4f86de&scene=0#wechat_redirect"
                 }
-        返回4个，应该表示正处于检测中，可以通过其中的 success_msg 获取阅读情况，目前一致的阅读情况有：阅读成功
+        返回4个，应该表示正处于检测中，可以通过其中的 success_msg 获取阅读情况，目前已知的阅读情况有：阅读成功
             {
               "check_finish": 1,
               "success_msg": "阅读成功",
@@ -245,32 +250,6 @@ class RspDoRead(BaseModel):
         if self.msg is not None:
             count += 1
         return count
-
-
-class ArticleInfo(BaseModel):
-    """文章信息"""
-    article_url: str
-    article_biz: str
-    article_title: str
-    article_author: str
-    article_desc: str
-
-    def __str__(self):
-        msg = ["【文章信息】"]
-        if self.article_biz:
-            msg.append(f"> 文章BIZ: {self.article_biz}")
-        if self.article_url:
-            msg.append(f"> 文章链接: {self.article_url}")
-        if self.article_title:
-            msg.append(f"> 文章标题: {self.article_title}")
-        if self.article_author:
-            msg.append(f"> 文章作者: {self.article_author}")
-        if self.article_desc:
-            msg.append(f"> 文章描述: {self.article_desc}")
-        return "\n".join(msg)
-
-    def __repr__(self):
-        return self.__str__()
 
 
 class RspWithdrawalUser(BaseModel):

@@ -9,8 +9,8 @@ import logging
 import os
 import threading
 
-from colorama import Fore, Style
-from httpx import Response
+from colorama import Fore, Style, init
+from httpx import Response, URL
 from pydantic import BaseModel
 
 from utils import get_date
@@ -74,7 +74,9 @@ class NestedLogColors:
 
 
 class Logger:
-    def __init__(self, name: str, fh_level=logging.DEBUG, ch_level=logging.INFO):
+    def __init__(self, name: str, fh_level=logging.DEBUG, ch_level=logging.INFO, is_init_colorama=True):
+        if is_init_colorama:
+            init()
         self.logger = logging.getLogger(name)
         self.logger.setLevel(logging.DEBUG)
         path_dir = os.path.join(logs_dir, name)
@@ -140,6 +142,10 @@ class Logger:
             msg = msg.__str__()
         elif isinstance(msg, Exception):
             msg = str(msg)
+        elif isinstance(msg, URL):
+            msg = str(msg)
+        elif isinstance(msg, object):
+            msg = msg.__str__()
 
         level_name = logging.getLevelName(level)
         level_color = getattr(LogColors, level_name)
@@ -219,8 +225,8 @@ class Logger:
 
 
 class ThreadLogger(Logger):
-    def __init__(self, name: str, thread2name: dict = None):
-        super().__init__(name)
+    def __init__(self, name: str, thread2name: dict = None, is_init_colorama: bool = True):
+        super().__init__(name, is_init_colorama=is_init_colorama)
         self.thread2name = thread2name
 
     @property
@@ -236,32 +242,64 @@ class ThreadLogger(Logger):
         finally:
             lock.release()
 
+
+
     @property
     def is_log_response(self):
         return self.thread2name.get('is_log_response', False)
 
     def info(self, msg, *args, **kwargs):
-        super().info(msg, *args, prefix=self.name, **kwargs)
+        ident = kwargs.pop("ident", None)
+        if ident is not None:
+            name = self.thread2name.get(ident, "")
+        else:
+            name = self.name
+        super().info(msg, *args, prefix=name, **kwargs)
 
     def debug(self, msg, *args, **kwargs):
-        super().debug(msg, *args, prefix=self.name, **kwargs)
+        ident = kwargs.pop("ident", None)
+        if ident is not None:
+            name = self.thread2name.get(ident, "")
+        else:
+            name = self.name
+        super().debug(msg, *args, prefix=name, **kwargs)
 
     def war(self, msg, *args, **kwargs):
-        super().war(msg, *args, prefix=self.name, **kwargs)
+        ident = kwargs.pop("ident", None)
+        if ident is not None:
+            name = self.thread2name.get(ident, "")
+        else:
+            name = self.name
+        super().war(msg, *args, prefix=name, **kwargs)
 
     def error(self, msg, *args, **kwargs):
-        super().error(msg, *args, prefix=self.name, **kwargs)
+        ident = kwargs.pop("ident", None)
+        if ident is not None:
+            name = self.thread2name.get(ident, "")
+        else:
+            name = self.name
+        super().error(msg, *args, prefix=name, **kwargs)
 
     def cri(self, msg, *args, **kwargs):
-        super().cri(msg, *args, prefix=self.name, **kwargs)
+        ident = kwargs.pop("ident", None)
+        if ident is not None:
+            name = self.thread2name.get(ident, "")
+        else:
+            name = self.name
+        super().cri(msg, *args, prefix=name, **kwargs)
 
     def response(self, prefix: str, response: Response, *args, **kwargs):
         if not self.is_log_response:
             return
+        ident = kwargs.pop("ident", None)
+        if ident is not None:
+            name = self.thread2name.get(ident, "")
+        else:
+            name = self.name
         super().response(
             prefix,
             response,
             *args,
-            prefix_tag=self.name,
+            prefix_tag=name,
             **kwargs
         )

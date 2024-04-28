@@ -39,6 +39,9 @@
 # 【选填】 是否使用 企业微信机器人推送（可单独配置）
 # 功能描述：当 push_type为 2 时生效，默认为True
 #use_robot: true
+# 【选填】 是否使用 markdown 格式文本推送，默认不使用，仅推送文章链接
+# 功能描述：markdown格式更好看，但是有的微信可能不支持（群友反馈）
+#is_push_markdown: false
 # 【必/选填】 企业微信机器人的webhook地址（可单独配置）
 # 功能描述：当 use_robot为 true 时生效
 #webhook_url: "https://..."
@@ -66,23 +69,39 @@
 #  push_delay:
 #    - 19
 
-# 【目前暂不支持】【选填】自动等待下批文章阅读（可单独配置），默认为 false
+# 【选填】自动等待下批文章阅读（可单独配置），默认为 false
 # 功能描述：出现如："下一批文章将在42分钟后到来"的消息后，是否自动睡眠
 #wait_next_read: true
-# 【目前暂不支持】【选填】 最大线程数，默认为 1
+# 【选填】 最大线程数，默认为 1
 # 功能描述：设置线程池的最大线程数，每个线程可以单独跑一个账号
 #max_thread_count: 1
-
-# 【选填】 全局的支付宝提现账号（可单独配置），默认为空，则表示微信提现
-#aliName: ""
-#aliAccount: ""
 
 # 【选填】是否需要提现，默认为 true，表示需要（可单独配置）
 # 功能描述：可以用于阅读信息获取任务，限制提现请求
 is_withdraw: true
 
-# 【选填】全局提现金额（单位：元）（可单独配置）
+# 【选填】提现额度限制（可单独配置）
+# 功能描述：只有达到或者大于这个金额才允许提现
 #withdraw: 0.9
+
+# 【选填】提现方式：wx or ali （可单独配置）
+# 功能描述：wx表示微信提现，ali表示支付宝提现
+#withdraw_type: wx
+# 【选填】 全局的支付宝提现账号（可单独配置），默认为 None
+# 功能描述：先在上方选择 ali，再在此处填写对应的支付宝账号
+# Tips: 如果这里不填写，则会使用默认已经绑定的支付宝（如果账号已经绑定过，这里就算填写其他的，也会使用账号绑定的支付宝账号进行提现）
+#aliName: ""
+#aliAccount: ""
+
+# 【选填】达到指定阅读篇数，走推送通道，默认为空
+# 功能描述：不想每一轮第一篇都走推送，则可以开启此配置项（可以自行增加数量，不一定固定两个）
+# 配置方式 1：
+#custom_detected_count: [1, 101, 151]
+# 配置方式 2:
+#custom_detected_count:
+#  - 1
+#  - 101
+#  - 151
 
 # 【选填】第一次循环是否走推送
 # 功能描述：不管当前具体是第几轮第几篇，只要是刚运行程序，那么第一篇文章是否走推送
@@ -93,10 +112,19 @@ account_data:
   # 账号名（自定义）
   账号1:
     # 【必填】
-    # 抓包简述：开启抓包后，进入主页面，再回到抓包软件，筛选出链接中包含 user or workinfo，复制其中的cookie值即可
+    # 抓包简述：开启抓包后，进入主页面，再回到抓包软件，筛选出链接中包含 get_read_url 或者 tuijian，复制其中的cookie值即可
+    # 貌似通过 PC微信 抓取的Cookie会出现过期现象，推荐抓取微信APP的Cookie
+    # 无 root 的可以使用虚拟机，然后在虚拟机中登录微信APP，只需要抓取虚拟机的数据包即可
     cookie: "klyd_1"
-    # 【必填】WxPusher中的用户UID，检测文章通知会单独发给这个微信用户
-    uid: "1"
+    # 【必/选填】WxPusher中的用户UID，检测文章通知会单独发给这个微信用户
+    # 功能描述：单独给此账号推送，微信要订阅 WxPusher的 -> 应用管理 -> 关注应用
+    # 当 [设置了topicIds] 后，[uid可以注释/删掉]
+    # 当 [未填写topicIds] 时，[uid必须填写]（!!! 一定要在 【关注应用】中订阅 !!!）
+#    uid: "1"
+    # 【选填】自动等待下批文章阅读（优先级比全局配置高）
+#    wait_next_read: true
+    # 【选填】自定义 user-agent
+#    ua: ""
 
 #  账号2:
 #    cookie: "klyd_2"
@@ -104,20 +132,3 @@ account_data:
 #  账号3:
 #    cookie: "klyd_3"
 #    uid: "3"
-# 用于漏网之鱼检测（数据来源：幻生大佬）
-biz_data:
-  - "MzkxNTE3MzQ4MQ=="
-  - "Mzg5MjM0MDEwNw=="
-  - "MzUzODY4NzE2OQ=="
-  - "MzkyMjE3MzYxMg=="
-  - "MzkxNjMwNDIzOA=="
-  - "Mzg3NzUxMjc5Mg=="
-  - "Mzg4NTcwODE1NA=="
-  - "Mzk0ODIxODE4OQ=="
-  - "Mzg2NjUyMjI1NA=="
-  - "MzIzMDczODg4Mw=="
-  - "Mzg5ODUyMzYzMQ=="
-  - "MzU0NzI5Mjc4OQ=="
-  - "Mzg5MDgxODAzMg=="
-  - "MzIzMDczODg4Mw=="
-  - "MzkxNDU1NDEzNw=="

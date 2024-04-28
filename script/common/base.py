@@ -5,6 +5,7 @@
 【创建时间】2024-04-01
 【功能描述】
 """
+import asyncio
 import random
 import re
 import sys
@@ -16,16 +17,22 @@ from http.cookies import SimpleCookie
 from json import JSONDecodeError
 from queue import Queue
 from typing import Type
+from urllib.parse import ParseResult, quote_plus
 
 import httpx
+import websockets
 from httpx import URL
 from pydantic import BaseModel, ValidationError
 
-from exception.common import PauseReadingTurnNext, Exit, StopReadingNotExit, ExitWithCodeChange, CookieExpired, \
-    RspAPIChanged
-from schema.klyd import KLYDAccount
+from config import load_detected_data, store_detected_data
+from exception.common import PauseReadingAndCheckWait, Exit, StopReadingNotExit, ExitWithCodeChange, \
+    CookieExpired, \
+    RspAPIChanged, PauseReadingTurnNext, StopReadingAndExit
+from exception.klyd import WithdrawFailed, FailedPassDetect
+from schema.common import ArticleInfo
+from utils import md5, run_async
 from utils.logger_utils import ThreadLogger, NestedLogColors
-from utils.push_utils import WxPusher
+from utils.push_utils import WxPusher, WxBusinessPusher
 
 
 class WxReadTaskBase(ABC):
@@ -43,7 +50,23 @@ class WxReadTaskBase(ABC):
     # 缓存
     _cache = {}
 
-    def __init__(self, config_data, logger_name: str):
+    # 文章标题
+    ARTICLE_TITLE_COMPILE = re.compile(r'meta.*?og:title"\scontent="(.*?)"\s*/>', re.S)
+    # 文章作者
+    ARTICLE_AUTHOR_COMPILE = re.compile(r'meta.*?og:article:author"\scontent="(.*?)"\s*/>', re.S)
+    # 文章描述
+    ARTICLE_DESC_COMPILE = re.compile(r'meta.*?og:description"\scontent="(.*?)"\s*/>', re.S)
+    # 文章Biz
+    ARTICLE_BIZ_COMPILE = re.compile(r"og:url.*?__biz=(.*?)&", re.S)
+
+    # 普通链接Biz提取
+    NORMAL_LINK_BIZ_COMPILE = re.compile(r"__biz=(.*?)&", re.S)
+
+    # 检测有效阅读链接
+    ARTICLE_LINK_VALID_COMPILE = re.compile(
+        r"^https?://mp.weixin.qq.com/s\?__biz=[^&]*&mid=[^&]*&idx=\d*&(?!.*?chksm).*?&scene=\d*#wechat_redirect$")
+
+    def __init__(self, config_data, logger_name: str, *args, **kwargs):
         self.config_data = config_data
         self.lock = threading.Lock()
         self.accounts = config_data.account_data
@@ -54,15 +77,17 @@ class WxReadTaskBase(ABC):
         self.base_url: URL | None = None
         # 构建基本请求头
         self.base_headers = self.build_base_headers()
+        self.global_kwargs = kwargs
         # 构建主线程客户端
-        self.main_client = httpx.Client(headers=self.base_headers, timeout=10)
+        self.main_client = httpx.Client(headers=self.base_headers, timeout=10, verify=False)
         # # 构建基本客户端
         # self.base_client = httpx.Client(headers=self.base_headers, timeout=10)
 
         self.thread2name = {
             "is_log_response": self.is_log_response,
         }
-        self.logger = ThreadLogger(logger_name, thread2name=self.thread2name)
+        self.logger = ThreadLogger(logger_name, thread2name=self.thread2name,
+                                   is_init_colorama=self.config_data.init_colorama)
 
         self.init_fields()
 
@@ -72,46 +97,65 @@ class WxReadTaskBase(ABC):
         else:
             thread_count = len(self.accounts)
 
+        self.max_thread_count = thread_count
+
         self.logger.info(NestedLogColors.blue(
             "\n".join([
                 f"{NestedLogColors.black('【脚本信息】', 'blue')}",
-                f"> 作者：{self.CURRENT_SCRIPT_AUTHOR}",
-                f"> 版本号：{self.CURRENT_SCRIPT_VERSION}",
-                f"> 任务名称：{self.CURRENT_TASK_NAME}",
-                f"> 创建时间：{self.CURRENT_SCRIPT_CREATED}",
-                f"> 更新时间：{self.CURRENT_SCRIPT_UPDATED}",
+                f"❄️>> 作者：{self.CURRENT_SCRIPT_AUTHOR}",
+                f"❄️>> 版本号：{self.CURRENT_SCRIPT_VERSION}",
+                f"❄️>> 任务名称：{self.CURRENT_TASK_NAME}",
+                f"❄️>> 创建时间：{self.CURRENT_SCRIPT_CREATED}",
+                f"❄️>> 更新时间：{self.CURRENT_SCRIPT_UPDATED}",
             ])
         ))
 
         self.logger.info(NestedLogColors.blue(
             "\n".join([
                 f"{NestedLogColors.black('【任务配置信息】', 'blue')}",
-                f"> 账号数量：{len(self.accounts)}",
-                f"> 账号队列: {[name for name in self.accounts.keys()]}",
-                f"> 最大线程数：{thread_count}",
-                f"> 配置来源: {self.source}",
-                f"> 入口链接（实时更新）: {self.entry_url}"
+                f"❄️>> 账号数量：{len(self.accounts)}",
+                f"❄️>> 账号队列: {[name for name in self.accounts.keys()]}",
+                f"❄️>> 最大线程数：{thread_count}",
+                f"❄️>> 配置来源: {self.source}",
+                f"❄️>> 入口链接（实时更新）: {self.entry_url}"
             ])
         ))
+        self.load_detected = kwargs.pop("load_detected", False)
+        if self.load_detected:
+            self.logger.info("")
+            self.logger.war("> > 🟡 正在加载本地文章检测数据...")
+            self.logger.war("> > 🟡 [Tips] 此数据会在程序运行过程中自动收集检测未通过时的文章链接")
+            self.detected_data = load_detected_data()
+        else:
+            self.detected_data = set()
+        self.new_detected_data = set()
 
         self.wait_queue = Queue()
 
-        with ThreadPoolExecutor(max_workers=thread_count, thread_name_prefix="klyd") as executor:
-            self.futures = [executor.submit(self._base_run, name) for name in self.accounts.keys()]
+        with ThreadPoolExecutor(max_workers=thread_count, thread_name_prefix="MoMingLog") as executor:
+            self.futures = [executor.submit(self._base_run, name, executor) for name in self.accounts.keys()]
             for future in as_completed(self.futures):
                 # 接下来的程序都是在主线程中执行
                 executor.submit(self.start_queue)
 
-        self.wait_queue.join()
+            if not self.wait_queue.empty():
+                self.wait_queue.join()
+            else:
+                sys.exit(0)
 
     @abstractmethod
-    def init_fields(self):
-        """这个方法执行在主线程中，可以用来进行账号运行前的初始化操作"""
+    def init_fields(self, retry_count: int = 3):
+        """这个方法执行在主线程中，可以用来进行账号运行前的初始化操作
+        :param retry_count:
+        """
         pass
 
     @abstractmethod
-    def run(self, name):
-        """账号运行的主入口"""
+    def run(self, name, *args, **kwargs):
+        """账号运行的主入口
+        :param *args:
+        :param **kwargs:
+        """
         pass
 
     @abstractmethod
@@ -119,24 +163,57 @@ class WxReadTaskBase(ABC):
         """返回入口链接"""
         pass
 
-    def _base_run(self, name):
+    @property
+    def failed_pass_count(self):
+        return self.failed_pass_count
+
+    @failed_pass_count.setter
+    def failed_pass_count(self, value):
+        self.lock.acquire()
+        self.failed_pass_count = value
+        self.lock.release()
+
+    @property
+    def max_failed_pass_count(self):
+        ret = self.account_config.max_failed_pass_count
+        if ret is None:
+            ret = self.config_data.max_failed_pass_count
+        return ret if ret is not None else 0
+
+    def _base_run(self, name, executor):
         # 接下来的程序都是在线程中执行
         # 将用户名存入字典中（用于设置logger的prefix）
         self.thread2name[self.ident] = name
         try:
-            self.run(name)
-        except StopReadingNotExit as e:
-            self.logger.info(f"🔘 {e}")
-            return
-        except (RspAPIChanged, ExitWithCodeChange) as e:
-            self.logger.error(e)
-            sys.exit(0)
-        except CookieExpired as e:
+            if self.load_detected:
+                if self.detected_data is not None:
+                    self.logger.info(f"🟢 加载检测数据成功! 当前已自动收集检测文章个数: {len(self.detected_data) + len(self.new_detected_data)}")
+                else:
+                    self.logger.war("🟡 本地暂无检测文章数据")
+            self.logger.info("")
+            self.run(name, executor=executor)
+        except (StopReadingNotExit, WithdrawFailed, CookieExpired) as e:
             self.logger.war(e)
             return
+        except FailedPassDetect as e:
+            self.logger.war(e)
+            self.is_need_withdraw = False
+            if self.max_failed_pass_count == 0:
+                return
+            else:
+                self.failed_pass_count += 1
+            if self.failed_pass_count >= self.max_failed_pass_count:
+                self.logger.error(f"🔴 达到最大检测未通过账号数量，程序即将停止运行")
+                sys.exit(0)
+        except (RspAPIChanged, ExitWithCodeChange, StopReadingAndExit) as e:
+            self.logger.error(e)
+            sys.exit(0)
         except PauseReadingTurnNext as e:
+            self.logger.info(e)
+            return
+        except PauseReadingAndCheckWait as e:
             self.lock.acquire()
-            self.logger.info(f"🟢🔶 {e}")
+            self.logger.info(e)
             if self.is_wait_next_read:
                 self.logger.info("✳️ 检测到开启了【等待下次阅读】的功能")
                 # 提取数字
@@ -152,10 +229,19 @@ class WxReadTaskBase(ABC):
             self.is_need_withdraw = False
             self.logger.exception(e)
             sys.exit(0)
-        # finally:
-        #     self.base_client = None
-        #     self.read_client = None
-        #     self.article_client = None
+        finally:
+            if self.new_detected_data:
+                self.logger.war(f"🟡 正在存储新的检测数据...")
+                if store_detected_data(self.new_detected_data, old_data=self.detected_data):
+                    self.logger.info(f"🟢 存储成功，此次自动收集检测文章个数: {len(self.new_detected_data)}")
+            if self.lock.locked():
+                self.lock.release()
+            # 如果是单线程，并且账号数大于1
+            if self.max_thread_count == 1 and len(self.accounts) > 1:
+                # 则重置所有的client，避免出现client资源污染的现象
+                self.base_client = None
+                self.read_client = None
+                self.article_client = None
 
     def start_queue(self):
         while not self.wait_queue.empty():
@@ -164,38 +250,154 @@ class WxReadTaskBase(ABC):
             self.__start_wait_next_read(wait_time, name)
             self.wait_queue.task_done()
 
-    def __start_wait_next_read(self, wait_minute, name):
+    def __start_wait_next_read(self, wait_minute, name, last_wait_minute: int = None):
         self.thread2name[self.ident] = name
-        self.logger.error("等待下次阅读")
-        random_sleep_min = random.randint(1, 5)
-        self.logger.info(f"随机延迟【{random_sleep_min}】分钟")
-        self.logger.info(f"💤 程序将自动睡眠【{wait_minute + random_sleep_min}】分钟后开始阅读")
-        # 获取将来运行的日期
-        # 先获取时间戳
-        future_timestamp = int(time.time()) + int(wait_minute + random_sleep_min) * 60
-        from datetime import datetime
-        future_date = datetime.fromtimestamp(future_timestamp)
-        self.logger.info(f"🟢 预计将在【{future_date}】阅读下一批文章")
-        # 睡眠
-        self.logger.info(f"💤 💤 💤 睡眠中...")
-        time.sleep(wait_minute * 60)
-        self.logger.info(f"🟡 程序即将开始运行，剩余时间 {random_sleep_min} 分钟")
-        time.sleep(random_sleep_min * 60)
-        self.logger.info(f"🟢 程序已睡眠结束")
+        # 判断上一次等待时间是否不为空
+        if last_wait_minute is not None:
+            # 求差值，如果上一次等待时间大于此次等待时间，并且线程数为 1，则直接开始运行
+            if wait_minute - last_wait_minute <= 0 and self.max_thread_count == 1:
+                self.logger.info("🟢 程序已睡眠结束")
+        else:
+            random_sleep_min = random.randint(1, 5)
+            self.logger.info(f"随机延迟【{random_sleep_min}】分钟")
+            self.logger.info(f"💤 程序将自动睡眠【{wait_minute + random_sleep_min}】分钟后开始阅读")
+            # 获取将来运行的日期
+            # 先获取时间戳
+            future_timestamp = int(time.time()) + int(wait_minute + random_sleep_min) * 60
+            from datetime import datetime
+            future_date = datetime.fromtimestamp(future_timestamp)
+            self.logger.info(f"🟢 预计将在【{future_date}】阅读下一批文章")
+            # 睡眠
+            self.logger.info(f"💤 💤 💤 睡眠中...")
+            time.sleep(wait_minute * 60)
+            self.logger.info(f"🟡 程序即将开始运行，剩余时间 {random_sleep_min} 分钟")
+            time.sleep(random_sleep_min * 60)
+            self.logger.info(f"🟢 程序已睡眠结束")
+
         self.run(name)
 
-    def wx_pusher_link(self, link) -> bool:
+    def parse_wx_article(self, article_url, follow_redirects=True):
+        try:
+            # 获取文章源代码
+            article_page = httpx.get(article_url, headers=self.base_headers, follow_redirects=follow_redirects).text
+        except:
+            article_page = ""
+
+        if article_page is None:
+            self.logger.war(f"🟡 文章页面解析失败，原始文章链接为：{article_url}")
+            article_page = ""
+
+        if r := self.ARTICLE_BIZ_COMPILE.search(article_page):
+            article_biz = r.group(1)
+        else:
+            article_biz = ""
+        if r := self.ARTICLE_TITLE_COMPILE.search(article_page):
+            article_title = r.group(1)
+        else:
+            article_title = ""
+        if r := self.ARTICLE_AUTHOR_COMPILE.search(article_page):
+            article_author = r.group(1)
+        else:
+            article_author = ""
+        if r := self.ARTICLE_DESC_COMPILE.search(article_page):
+            article_desc = r.group(1)
+        else:
+            article_desc = ""
+        article_info = ArticleInfo(
+            article_url=article_url,
+            article_biz=article_biz,
+            article_title=article_title,
+            article_author=article_author,
+            article_desc=article_desc
+        )
+        return article_info
+
+    def wx_pusher(self, link, detecting_count: int = None) -> bool:
+        """
+        通过WxPusher推送
+        :param link:
+        :param detecting_count:
+        :return:
+        """
+        if detecting_count is None:
+            s = f"{self.CURRENT_TASK_NAME}过检测"
+        else:
+            s = f"{self.CURRENT_TASK_NAME}-{detecting_count}过检测"
+
+        if self.is_use_ws:
+            # 将原始link进行编码
+            link = quote_plus(link)
+            client_id, target_id, link = self.generate_detected_url(link)
+            threading.Thread(target=self.sync_ws_endpoint, args=(self.ident, client_id, target_id)).start()
+            status = self.get_connect_status(self.ident)
+            self.wait_for_connect_ws()
+
         return WxPusher.push_article(
             appToken=self.wx_pusher_token,
-            title=f"{self.CURRENT_TASK_NAME}过检测",
+            title=s,
             link=link,
             uids=self.wx_pusher_uid,
             topicIds=self.wx_pusher_topicIds
         )
 
+    def wx_business_pusher(self, link, detecting_count: int = None, **kwargs) -> bool:
+        """
+        通过企业微信推送
+        :param link:
+        :param detecting_count:
+        :param kwargs:
+        :return:
+        """
+        if detecting_count is None:
+            s = f"{self.CURRENT_TASK_NAME}过检测"
+        else:
+            s = f"{self.CURRENT_TASK_NAME}-{detecting_count}过检测"
+
+        if self.is_use_ws:
+            # 将原始link进行编码
+            link = quote_plus(link)
+            client_id, target_id, link = self.generate_detected_url(link)
+            threading.Thread(target=self.sync_ws_endpoint, args=(self.ident, client_id, target_id)).start()
+            self.wait_for_connect_ws()
+
+        if self.wx_business_use_robot:
+            return WxBusinessPusher.push_article_by_robot(
+                self.wx_business_webhook_url,
+                s,
+                link,
+                is_markdown=self.wx_business_is_push_markdown,
+                **kwargs)
+        else:
+            return WxBusinessPusher.push_article_by_agent(
+                self.wx_business_corp_id,
+                self.wx_business_corp_secret,
+                self.wx_business_agent_id,
+                title=s,
+                link=link,
+                **kwargs
+            )
+
+    def wait_for_connect_ws(self):
+        status = self.get_connect_status(self.ident)
+        while True:
+            if status is None:
+                self.logger.war("🟡 正在等待接入回调服务(接入成功后再推送文章)...")
+                status = self.get_connect_status(self.ident)
+                time.sleep(1)
+                continue
+            else:
+                if status:
+                    self.logger.info("🟢✅️ 回调服务接入成功!正在准备推送文章... ")
+                    break
+                else:
+                    raise StopReadingAndExit(f"服务对接失败，请检查网络或此服务地址 {self.ws_host} 已失效", )
+
+    def __request_article_page(self, article_url: str):
+        return self.request_for_page(article_url, "请求文章信息 article_client", client=self.article_client)
+
     def request_for_json(self, method: str, url: str | URL, prefix: str, *args, client: httpx.Client = None,
                          model: Type[BaseModel] = None,
-                         **kwargs) -> dict | BaseModel | str:
+                         **kwargs) -> dict | BaseModel | str | None:
         """获取json数据"""
 
         update_headers = kwargs.pop("update_headers", {})
@@ -206,7 +408,7 @@ class WxReadTaskBase(ABC):
             "Accept": "application/json, text/plain, */*",
             **update_headers,
         }, ret_types=[RetTypes.JSON, *ret_types], **kwargs)
-        if model is not None:
+        if model is not None and ret is not None:
             ret = self.__to_model(model, ret)
         return ret
 
@@ -264,6 +466,7 @@ class WxReadTaskBase(ABC):
             ret_types = [ret_types]
         flag = False
         if url is None:
+            self.logger.error("检测到要请求的链接为空，已自动结束请求并退成程序!")
             raise Exit()
 
         response = None
@@ -312,12 +515,13 @@ class WxReadTaskBase(ABC):
             if len(ret_data) == 1:
                 return ret_data[0]
             return ret_data
-        except httpx.ConnectTimeout as e:
-            self.logger.error(f"请求超时, 剩余重试次数：{retry_count}")
+        except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            self.logger.error(f"请求超时, 剩余重试次数：{retry_count - 1}")
             if retry_count > 0:
                 if flag:
                     client.close()
-                self.lock.release()
+                if self.lock.locked():
+                    self.lock.release()
                 return self._request(method, url, prefix, *args, client=client, update_headers=update_headers,
                                      ret_types=ret_types, retry_count=retry_count - 1, **kwargs)
             else:
@@ -333,7 +537,111 @@ class WxReadTaskBase(ABC):
         finally:
             if flag:
                 client.close()
-            self.lock.release()
+            if self.lock.locked():
+                self.lock.release()
+
+    async def websocket_endpoint(self, ident, client_id: str, target_id: str):
+        url = f"ws://{self.ws_host}/mmlg/callback/ct/ws/{target_id}"
+        success_msg = f"{client_id}:检测文章访问状态已上传记录成功! 正在准备跳转链接..."
+        try:
+            async with websockets.connect(url, timeout=10) as ws:
+                self.set_connect_status(ident, True)
+                self.logger.info(f"🟢 服务对接成功，正在准备等待访问结果...", ident=ident)
+                while True:
+                    try:
+                        # 使用await确保正确执行recv
+                        msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                        self.logger.info(f"🟢 此消息用来调试：接收到客户端消息：{msg}", ident=ident)
+                        if msg == "true":
+                            self.set_access_result(ident, True)
+                            await ws.send(success_msg)
+                            break
+                    except asyncio.TimeoutError:
+                        self.logger.war("⚠️ 接收消息超时，正在重试...", ident=ident)
+        except Exception:
+            self.set_connect_status(ident, False)
+
+    def sync_ws_endpoint(self, ident, client_id: str, target_id: str):
+        try:
+            run_async(self.websocket_endpoint, ident, client_id, target_id)
+        except StopReadingAndExit as e:
+            raise e
+
+    def generate_detected_url(self, article_url):
+        client_id = md5(f"client_id_{self.ident}_{self.logger.name}_{time.time()}_{random.randint(1000, 9999)}")
+        target_id = md5(f"target_id_{self.ident}_{self.logger.name}_{time.time()}_{random.randint(1000, 9999)}")
+        return client_id, target_id, f"http://{self.ws_host}/mmlg/callback/ct/get-link?client_id={client_id}&target_id={target_id}&redirect={article_url}"
+
+    def get_access_result(self, ident) -> bool:
+        return self._cache.get(f"is_detected_article_{ident}", False)
+
+    def set_access_result(self, ident, value: bool):
+        self._cache[f"is_detected_article_{ident}"] = value
+
+    def get_connect_status(self, ident) -> bool | None:
+        return self._cache.get(f"is_connected_{ident}", None)
+
+    def set_connect_status(self, ident, value: bool):
+        self._cache[f"is_connected_{ident}"] = value
+
+    @property
+    def is_use_ws(self):
+        ret = self.config_data.is_use_ws
+        return ret if ret is not None else False
+
+    @property
+    def ws_host(self):
+        ret = self.config_data.ws_host
+        return ret if ret is not None else "127.0.0.1:6699"
+
+    @property
+    def wx_business_is_push_markdown(self):
+        ret = self.account_config.is_push_markdown
+        if ret is None:
+            ret = self.config_data.is_push_markdown
+        return ret if ret is not None else False
+
+    @property
+    def wx_business_use_robot(self):
+        ret = self.account_config.use_robot
+        if ret is None:
+            ret = self.config_data.use_robot
+        return ret if ret is not None else True
+
+    @property
+    def wx_business_webhook_url(self):
+        ret = self.account_config.webhook_url
+        if ret is None:
+            ret = self.config_data.webhook_url
+        return ret
+
+    @property
+    def wx_business_corp_id(self):
+        ret = self.account_config.corp_id
+        if ret is None:
+            ret = self.config_data.corp_id
+        return ret
+
+    @property
+    def wx_business_agent_id(self):
+        ret = self.account_config.agent_id
+        if ret is None:
+            ret = self.config_data.agent_id
+        return ret
+
+    @property
+    def wx_business_corp_secret(self):
+        ret = self.account_config.corp_secret
+        if ret is None:
+            ret = self.config_data.corp_secret
+        return ret
+
+    @property
+    def push_types(self):
+        ret = self.account_config.push_types
+        if ret is None:
+            ret = self.config_data.push_types
+        return ret if ret is not None else [1]
 
     @property
     def is_wait_next_read(self):
@@ -344,12 +652,28 @@ class WxReadTaskBase(ABC):
         return ret if ret is not None else False
 
     @property
+    def is_withdraw(self):
+        """是否需要提现"""
+        ret = self.account_config.is_withdraw
+        if ret is None:
+            ret = self.config_data.is_withdraw
+        return ret if ret is not None else True
+
+    @property
     def is_need_withdraw(self):
         return self._cache.get(f"is_need_withdraw_{self.ident}", False)
 
     @is_need_withdraw.setter
     def is_need_withdraw(self, value):
         self._cache[f"is_need_withdraw_{self.ident}"] = value
+
+    @property
+    def current_read_count(self):
+        return self._cache.get(f"current_read_count_{self.ident}")
+
+    @current_read_count.setter
+    def current_read_count(self, value):
+        self._cache[f"current_read_count_{self.ident}"] = value
 
     @property
     def base_client(self):
@@ -362,6 +686,25 @@ class WxReadTaskBase(ABC):
             self._cache.pop(f"base_client_{self.ident}", None)
         else:
             self._cache[f"base_client_{self.ident}"] = value
+
+    def parse_base_url(self, url: str | URL | ParseResult, client: httpx.Client):
+        """
+        提取出用于设置 base_url的数据，并完成配置
+        :param url:
+        :param client:
+        :return:
+        """
+        if isinstance(url, str):
+            url = URL(url)
+
+        protocol = url.scheme
+
+        if isinstance(url, URL):
+            host = url.host
+        else:
+            host = url.hostname
+        client.base_url = f"{protocol}://{host}"
+        return protocol, host
 
     @property
     def read_client(self):
@@ -387,7 +730,7 @@ class WxReadTaskBase(ABC):
         else:
             self._cache[f"article_client_{self.ident}"] = value
 
-    def _get_client(self, client_name: str, headers: dict = None, verify: bool = True) -> httpx.Client:
+    def _get_client(self, client_name: str, *args, headers: dict = None, verify: bool = True, **kwargs) -> httpx.Client:
         """
         获取客户端
         :param client_name: 客户端名称
@@ -399,10 +742,50 @@ class WxReadTaskBase(ABC):
         client = self._cache.get(client_name)
         if client is None:
             if headers is None:
-                headers = self.build_base_headers(self.account_config)
-            client = httpx.Client(headers=headers, timeout=10, verify=verify)
+                try:
+                    headers = self.build_base_headers(self.account_config)
+                except KeyError:
+                    headers = self.build_base_headers()
+            client = httpx.Client(*args, base_url=kwargs.pop("base_url", ""), headers=headers, timeout=10,
+                                  verify=verify, **kwargs)
             self._cache[client_name] = client
         return client
+
+    def sleep_fun(self, is_pushed: bool = False, prefix: str = "") -> int:
+        """
+        睡眠随机时间
+        :param is_pushed: 是否推送
+        :param prefix: 阅读文章标签，例如 [1 - 1] 表示第1轮第1篇
+        :return: 返回睡眠的时间
+        """
+        t = self.push_delay[0] if is_pushed else random.randint(self.read_delay[0], self.read_delay[1])
+        self.logger.info(f"等待检测{prefix}完成, 💤 睡眠{t}秒" if is_pushed else f"💤 {prefix}随机睡眠{t}秒")
+        tmp = t
+        if self.is_use_ws and is_pushed:
+            # 睡眠随机时间
+            while True:
+                if tmp == 0:
+                    raise PauseReadingTurnNext("此用户未访问检测文章! ")
+                if self.get_access_result(self.ident):
+                    self.logger.info(f'🟢✅ ️接收到访问通知!剩余睡眠时间: {tmp}')
+                    if tmp < 6:
+                        self.logger.war(f'🟡 由于剩余睡眠时间过少，故重置睡眠时间 10 秒')
+                        tmp = 10
+                    self.set_access_result(self.ident, False)
+                    break
+                else:
+                    self.logger.war(f'🟡 用户还未访问检测文章，剩余时间{tmp}，请尽快访问!')
+                time.sleep(1)
+                tmp -= 1
+        time.sleep(tmp)
+        return t
+
+    @property
+    def custom_detected_count(self):
+        ret = self.account_config.custom_detected_count
+        if ret is None:
+            ret = self.config_data.custom_detected_count
+        return ret if ret is not None else []
 
     @property
     def wx_pusher_token(self):
@@ -425,14 +808,37 @@ class WxReadTaskBase(ABC):
 
     @property
     def read_delay(self):
+        ret = [10, 20]
         delay = self.account_config.delay
-        ret = delay.read_delay if delay is not None else self.config_data.delay.read_delay
+        if delay is None:
+            delay = self.config_data.delay
+        _read_delay = delay.read_delay
+        if _read_delay is not None:
+            _len = len(_read_delay)
+            if _len == 2:
+                _min = min(_read_delay)
+                _max = max(_read_delay)
+                ret = [_min, _max]
+            else:
+                _max = max(ret)
+                ret = [10, _max]
         return ret
 
     @property
     def push_delay(self):
+        ret = [19]
+
         delay = self.account_config.delay
-        ret = delay.push_delay if delay is not None else self.config_data.delay.push_delay
+        if delay is None:
+            delay = self.config_data.delay
+
+        _push_delay = delay.push_delay
+
+        if _push_delay is not None:
+            _len = len(_push_delay)
+            if _len != 1:
+                _max = max(_push_delay)
+                ret = [_max] if _max > 19 else [19]
         return ret
 
     @property
@@ -467,7 +873,7 @@ class WxReadTaskBase(ABC):
         return threading.current_thread().ident
 
     @property
-    def account_config(self) -> KLYDAccount:
+    def account_config(self):
         return self.accounts[self.logger.name]
 
     @property
@@ -483,7 +889,14 @@ class WxReadTaskBase(ABC):
         ret = self.config_data.is_log_response
         return ret if ret is not None else False
 
-    def build_base_headers(self, account_config: KLYDAccount = None):
+    @property
+    def first_while_to_push(self):
+        ret = self.account_config.first_while_to_push
+        if ret is None:
+            ret = self.config_data.first_while_to_push
+        return ret if ret is not None else False
+
+    def build_base_headers(self, account_config=None):
         if account_config is not None:
             ua = account_config.ua
         else:
